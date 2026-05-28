@@ -1,0 +1,14 @@
+[project]
+name = "superstar-auto-reader"
+version = "1.0.0"
+description = "超星学习通自动阅读脚本 - 模拟人类阅读行为，自动滚动文档积累阅读时长"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "playwright>=1.52.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pyinstaller>=6.20.0",
+]
