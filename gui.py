@@ -19,7 +19,7 @@ from typing import Optional
 
 # 从 main.py 导入核心组件（不修改 main.py）
 from main import (
-    DEFAULT_URL,
+    DEFAULT_URL, DEFAULT_BROWSER, BROWSER_CHOICES,
     SCROLL_MIN_INTERVAL, SCROLL_MAX_INTERVAL,
     SCROLL_MIN_PX, SCROLL_MAX_PX,
     BACK_PROBABILITY,
@@ -27,6 +27,8 @@ from main import (
     PAUSE_DURATION_MIN, PAUSE_DURATION_MAX,
     Stats, Scroller, schedule_stop,
     launch_browser, _pick_reading_page,
+    READING_PAGE_MARKERS,
+    firefox_driver_exists,
 )
 
 # ═══════════════════════════════════════════════════════════════
@@ -42,7 +44,7 @@ class LogRedirector:
         self._original = sys.stdout
 
     def write(self, text: str) -> None:
-        if text and text.strip():
+        if text:  # 保留 \n，确保逐行显示
             self.queue.put(text)
 
     def flush(self) -> None:
@@ -73,16 +75,25 @@ class GuiWorker:
     """在独立线程中运行 asyncio 事件循环，执行浏览器自动化全流程"""
 
     def __init__(self, url: str, duration_min: Optional[float],
-                 min_iv: float, max_iv: float):
+                 min_iv: float, max_iv: float,
+                 browser_type: str = DEFAULT_BROWSER,
+                 tab_index: Optional[int] = None):
         self.url = url
         self.duration_min = duration_min
         self.min_iv = min_iv
         self.max_iv = max_iv
+        self.browser_type = browser_type
+        self.tab_index = tab_index
         self.scroller: Optional[Scroller] = None
         self._ready = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._error: Optional[str] = None
         self._done = False
+        # 标签页交互选择
+        self._tabs_ready = threading.Event()
+        self._tab_chosen = threading.Event()
+        self._tab_info: list[tuple[int, str]] = []
+        self._selected_tab_idx: Optional[int] = None
 
     # ── 外部控制接口 ──
 
@@ -93,6 +104,20 @@ class GuiWorker:
     def signal_ready(self) -> None:
         """GUI 点「已就绪」后调用，通知工作线程继续"""
         self._ready.set()
+
+    @property
+    def tab_ready(self) -> bool:
+        """是否有待选择的标签页列表"""
+        return self._tabs_ready.is_set() and not self._tab_chosen.is_set()
+
+    def get_tab_info(self) -> list[tuple[int, str]]:
+        return self._tab_info
+
+    def select_tab(self, idx: int) -> None:
+        """由 GUI 线程调用，用户选择了标签页"""
+        if 0 <= idx < len(self._tab_info):
+            self._selected_tab_idx = idx
+            self._tab_chosen.set()
 
     def stop(self) -> None:
         if self.scroller:
@@ -130,16 +155,16 @@ class GuiWorker:
 
         try:
             # 1. 启动浏览器
-            print("🚀 启动 Edge 浏览器...")
-            pw, browser, ctx, page = await launch_browser()
+            label = {"edge": "Edge", "chrome": "Chrome", "firefox": "Firefox"}.get(self.browser_type, self.browser_type)
+            print(f"🚀 启动 {label} 浏览器...")
+            pw, browser, ctx, page = await launch_browser(browser_type=self.browser_type)
 
             # 2. 打开 URL
             print(f"📖 打开 {self.url}")
             try:
                 await page.goto(self.url, wait_until="domcontentloaded", timeout=15000)
-            except Exception as e:
-                print(f"⚠️  自动导航失败: {e}")
-                print("   请在浏览器中手动输入学习通网址。")
+            except Exception:
+                print("⚠️  无法自动打开页面，请在浏览器地址栏手动输入学习通网址。")
                 try:
                     await page.goto("about:blank")
                 except Exception:
@@ -165,10 +190,39 @@ class GuiWorker:
             print("📍 开始分析页面结构...")
             await asyncio.sleep(2)
 
-            # 4. 智能页面选择
-            page = await _pick_reading_page(ctx, page)
-            if page is None:
-                return
+            # 4. 标签页选择
+            if self.tab_index is not None:
+                # 用户在表单指定了序号
+                page = await _pick_reading_page(ctx, page, tab_index=self.tab_index)
+                if page is None:
+                    return
+            else:
+                # 先尝试自动匹配
+                current_url = (page.url or "").lower()
+                if any(m in current_url for m in READING_PAGE_MARKERS):
+                    print(f"✅ 当前页面已是阅读页，直接使用")
+                else:
+                    all_pages = ctx.pages
+                    candidates = [(i, p) for i, p in enumerate(all_pages)
+                                  if any(m in (p.url or "").lower() for m in READING_PAGE_MARKERS)]
+                    if len(candidates) == 1:
+                        idx, matched = candidates[0]
+                        await matched.bring_to_front()
+                        await asyncio.sleep(0.5)
+                        page = matched
+                        print(f"✅ 自动切换到阅读页")
+                    else:
+                        # 无匹配或多项匹配 → 弹窗选择
+                        print("📋 请从弹出窗口选择要操作的标签页...")
+                        self._tab_info = [(i, p.url or "(空白页)")
+                                          for i, p in enumerate(all_pages)]
+                        self._tabs_ready.set()
+                        if not await self._wait_tab_chosen(timeout=120):
+                            print("⚠️  标签页选择超时，请重新运行")
+                            return
+                        page = all_pages[self._selected_tab_idx]
+                        await page.bring_to_front()
+                        await asyncio.sleep(0.5)
 
             # 5. 启动滚动
             self.scroller = Scroller(page, stats,
@@ -216,6 +270,15 @@ class GuiWorker:
             await asyncio.sleep(0.5)
         return False
 
+    async def _wait_tab_chosen(self, timeout: float = 120) -> bool:
+        """轮询等待 GUI 线程完成标签页选择"""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if self._tab_chosen.is_set():
+                return True
+            await asyncio.sleep(0.3)
+        return False
+
 
 # ═══════════════════════════════════════════════════════════════
 # tkinter GUI 主窗口
@@ -232,6 +295,7 @@ class App:
         self.worker: Optional[GuiWorker] = None
         self.redirector: Optional[LogRedirector] = None
         self._poll_id: Optional[str] = None
+        self._showing_tab_picker = False
 
         # 样式
         style = ttk.Style()
@@ -252,14 +316,20 @@ class App:
         ttk.Label(frame, text="URL:").grid(row=0, column=0, sticky=tk.W, pady=4)
         self.var_url = tk.StringVar(value=DEFAULT_URL)
         self.entry_url = ttk.Entry(frame, textvariable=self.var_url, width=60)
-        self.entry_url.grid(row=0, column=1, columnspan=2, sticky=tk.EW, pady=4, padx=(5, 0))
+        self.entry_url.grid(row=0, column=1, columnspan=3, sticky=tk.EW, pady=4, padx=(5, 0))
 
-        # Duration
+        # Duration + Browser
         ttk.Label(frame, text="运行时长:").grid(row=1, column=0, sticky=tk.W, pady=4)
         self.var_duration = tk.StringVar(value="")
         self.entry_duration = ttk.Entry(frame, textvariable=self.var_duration, width=8)
         self.entry_duration.grid(row=1, column=1, sticky=tk.W, pady=4, padx=(5, 0))
-        ttk.Label(frame, text="分钟（留空=手动停止）").grid(row=1, column=2, sticky=tk.W, pady=4)
+        ttk.Label(frame, text="分钟").grid(row=1, column=2, sticky=tk.W, pady=4)
+        # browser 下拉
+        ttk.Label(frame, text="浏览器:").grid(row=1, column=3, sticky=tk.W, pady=4, padx=(15, 0))
+        self.var_browser = tk.StringVar(value=DEFAULT_BROWSER)
+        self.combo_browser = ttk.Combobox(frame, textvariable=self.var_browser, width=10,
+                                          values=BROWSER_CHOICES, state="readonly")
+        self.combo_browser.grid(row=1, column=4, sticky=tk.W, pady=4, padx=(5, 0))
 
         # Min interval
         ttk.Label(frame, text="最小间隔:").grid(row=2, column=0, sticky=tk.W, pady=4)
@@ -344,7 +414,8 @@ class App:
     def _enable_params(self, enabled: bool) -> None:
         s = tk.NORMAL if enabled else tk.DISABLED
         for w in [self.entry_url, self.entry_duration,
-                   self.entry_min_iv, self.entry_max_iv]:
+                   self.entry_min_iv, self.entry_max_iv,
+                   self.combo_browser]:
             w.configure(state=s)
 
     # ── 按钮事件 ──
@@ -381,12 +452,21 @@ class App:
             messagebox.showerror("参数错误", "最小间隔不能小于 1 秒")
             return
 
+        # 收集浏览器选择
+        browser_type = self.var_browser.get()
+
+        # Firefox 驱动检测
+        if browser_type == "firefox" and not firefox_driver_exists():
+            if not self._prompt_firefox_install():
+                return
+
         # 启动日志重定向
         self.redirector = LogRedirector(self.log_text)
         self.redirector.start()
 
-        # 启动后台工作线程
-        self.worker = GuiWorker(url, duration_min, min_iv, max_iv)
+        # 启动后台工作线程（tab_index=None → 弹窗选择）
+        self.worker = GuiWorker(url, duration_min, min_iv, max_iv,
+                                browser_type=browser_type, tab_index=None)
         self.worker.start()
 
         self._set_state("browser_launched")
@@ -424,8 +504,15 @@ class App:
         if self.redirector:
             self.redirector.poll()
 
+        # 检测是否需要弹出标签页选择窗口
+        if (self.worker and self.worker.tab_ready
+                and not self._showing_tab_picker):
+            self._showing_tab_picker = True
+            self._show_tab_picker()
+
         # 检查工作线程是否结束
         if self.worker and self.worker.is_done:
+            self._showing_tab_picker = False
             self._on_worker_done()
             return
 
@@ -435,9 +522,152 @@ class App:
         """工作线程结束后的清理"""
         if self.redirector:
             self.redirector.stop()
+        self._showing_tab_picker = False
         self._set_state("idle")
         self.worker = None
         self.redirector = None
+
+    # ── 标签页选择对话框 ──
+
+    def _show_tab_picker(self) -> None:
+        """弹出标签页选择窗口"""
+        if not self.worker:
+            self._showing_tab_picker = False
+            return
+
+        tabs = self.worker.get_tab_info()
+        if not tabs:
+            self._showing_tab_picker = False
+            return
+
+        dialog = tk.Toplevel(self.root)
+        dialog.title("选择标签页")
+        dialog.geometry("520x360")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        dialog.protocol("WM_DELETE_WINDOW", lambda: None)  # 禁止直接关
+
+        ttk.Label(dialog, text="当前打开了多个页面，请选择要操作的标签页：",
+                  wraplength=480).pack(pady=(10, 5), padx=10, anchor=tk.W)
+
+        frame = ttk.Frame(dialog)
+        frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+
+        listbox = tk.Listbox(frame, font=("Consolas", 10),
+                             selectbackground="#0078d4")
+        scrollbar = ttk.Scrollbar(frame, orient=tk.VERTICAL,
+                                  command=listbox.yview)
+        listbox.configure(yscrollcommand=scrollbar.set)
+
+        for i, (idx, url) in enumerate(tabs):
+            display = f"  [{idx + 1}]  {url[:72]}"
+            listbox.insert(tk.END, display)
+
+        listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        listbox.selection_set(0)
+
+        def on_ok():
+            sel = listbox.curselection()
+            if sel:
+                self.worker.select_tab(sel[0])
+                dialog.destroy()
+                self._showing_tab_picker = False
+
+        def on_cancel():
+            if self.worker:
+                self.worker.select_tab(0)
+                dialog.destroy()
+                self._showing_tab_picker = False
+            else:
+                dialog.destroy()
+                self._showing_tab_picker = False
+
+        btn_frame = ttk.Frame(dialog)
+        btn_frame.pack(fill=tk.X, padx=10, pady=(0, 10))
+        ttk.Button(btn_frame, text="确定", command=on_ok).pack(side=tk.RIGHT, padx=(5, 0))
+        ttk.Button(btn_frame, text="取消（默认第 1 个）", command=on_cancel).pack(side=tk.RIGHT)
+
+    # ── Firefox 驱动安装 ──
+
+    def _prompt_firefox_install(self) -> bool:
+        """检测到 Firefox 驱动未安装时弹窗引导，返回 True=继续，False=取消"""
+        dialog = tk.Toplevel(self.root)
+        dialog.title("安装 Firefox 驱动")
+        dialog.geometry("480x200")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        dialog.protocol("WM_DELETE_WINDOW", lambda: None)
+        dialog.resizable(False, False)
+
+        ttk.Label(dialog, text="🔥 Firefox 驱动未安装",
+                  font=("", 12, "bold")).pack(pady=(15, 5))
+        ttk.Label(dialog, text="首次使用 Firefox 需要下载驱动（约 150MB），仅需一次。",
+                  wraplength=440).pack(pady=(0, 5))
+        ttk.Label(dialog, text="也可以手动运行:  playwright install firefox",
+                  wraplength=440, foreground="gray").pack(pady=(0, 10))
+
+        result = [False]  # 闭包传值
+
+        def on_install():
+            result[0] = True
+            dialog.destroy()
+
+        def on_cancel():
+            result[0] = False
+            dialog.destroy()
+
+        btn_frame = ttk.Frame(dialog)
+        btn_frame.pack(pady=(5, 15))
+        ttk.Button(btn_frame, text="一键安装", command=on_install).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="取消，换 Edge", command=on_cancel).pack(side=tk.LEFT, padx=5)
+
+        self.root.wait_window(dialog)
+
+        if not result[0]:
+            return False
+
+        # 后台安装
+        self._set_state("stopping")
+        self.var_status.set("正在安装 Firefox 驱动...")
+        print("📥 开始下载 Firefox 驱动...")
+        self.root.update()
+
+        success = self._run_firefox_install()
+
+        if not success:
+            messagebox.showerror("安装失败",
+                "Firefox 驱动下载失败，请手动运行:\n\n  uv run playwright install firefox")
+            self._set_state("idle")
+            return False
+
+        print("✅ Firefox 驱动安装完成")
+        self.var_status.set("就绪")
+        self._set_state("idle")
+        return True
+
+    def _run_firefox_install(self) -> bool:
+        """运行 playwright install firefox，返回是否成功"""
+        import subprocess, sys, os
+        from main import _get_browsers_path
+        env = os.environ.copy()
+        env["PLAYWRIGHT_BROWSERS_PATH"] = _get_browsers_path()
+        try:
+            proc = subprocess.Popen(
+                [sys.executable, "-m", "playwright", "install", "firefox"],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, creationflags=subprocess.CREATE_NO_WINDOW,
+                env=env,
+            )
+            for line in proc.stdout:
+                if line.strip():
+                    print(f"  {line.strip()}")
+                    self.root.update()
+            proc.wait()
+            return proc.returncode == 0
+        except Exception as e:
+            print(f"  ❌ 安装异常: {e}")
+            return False
 
     # ── 启动 ──
 

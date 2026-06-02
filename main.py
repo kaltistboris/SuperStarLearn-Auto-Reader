@@ -5,11 +5,13 @@
 浏览器自动将滚轮事件路由到鼠标下方元素，天然支持跨 iframe。
 
 用法:
-    uv run python main.py                              # 手动 Ctrl+C 停止
+    uv run python main.py                              # 默认 Edge
+    uv run python main.py --browser chrome              # 使用 Chrome
+    uv run python main.py --browser firefox             # 使用 Firefox
     uv run python main.py --duration 30                 # 30 分钟后自动停止
-    uv run python main.py --duration 45 --url "..."     # 自定义起始 URL
+    uv run python main.py --tab 2                       # 选择第 3 个标签页
 
-依赖: playwright (channel=msedge, 使用系统 Edge 浏览器)
+依赖: playwright (channel=msedge/chrome/firefox)
 """
 
 import asyncio
@@ -28,6 +30,10 @@ from playwright.async_api import async_playwright, Browser, Page
 # ═══════════════════════════════════════════════════════════════
 
 DEFAULT_URL = "https://mooc1.chaoxing.com"
+DEFAULT_BROWSER = "edge"
+
+# 浏览器选择
+BROWSER_CHOICES = ["edge", "chrome", "firefox"]
 
 # 滚动
 SCROLL_MIN_INTERVAL = 2.0       # 滚动间隔下限（秒）
@@ -46,10 +52,38 @@ PAUSE_DURATION_MIN = 15         # 暂停 15~45 秒
 PAUSE_DURATION_MAX = 45
 
 # ═══════════════════════════════════════════════════════════════
+# 工具函数
+# ═══════════════════════════════════════════════════════════════
+
+def _get_browsers_path() -> str:
+    """
+    获取 Playwright 浏览器存储路径（支持 exe 环境）。
+    PyInstaller 打包后 playwright 会错误地在临时目录找浏览器，
+    通过设置环境变量 PLAYWRIGHT_BROWSERS_PATH 纠正。
+    """
+    import os
+    from pathlib import Path
+    # 优先读取已有环境变量（用户自定义），否则用默认路径
+    env = os.environ.get("PLAYWRIGHT_BROWSERS_PATH")
+    if env:
+        return env
+    return str(Path.home() / "AppData" / "Local" / "ms-playwright")
+
+
+def firefox_driver_exists() -> bool:
+    """检查 Playwright Firefox 驱动是否已下载（兼容 exe 环境）"""
+    from pathlib import Path
+    base = Path(_get_browsers_path())
+    if not base.exists():
+        return False
+    return any(p.name.startswith("firefox-") for p in base.iterdir() if p.is_dir())
+
+
+# ═══════════════════════════════════════════════════════════════
 # 反检测脚本
 # ═══════════════════════════════════════════════════════════════
 
-STEALTH_JS = """
+STEALTH_JS_CHROMIUM = """
 Object.defineProperty(navigator, 'webdriver', { get: () => false });
 window.chrome = { runtime: {}, loadTimes: function() {}, csi: function() {}, app: {} };
 Object.defineProperty(navigator, 'plugins', {
@@ -67,6 +101,16 @@ Object.defineProperty(navigator, 'languages', { get: () => ['zh-CN','zh','en-US'
 Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
 Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });
 Object.defineProperty(navigator, 'vendor', { get: () => 'Google Inc.' });
+delete window.callPhantom;
+delete window._phantom;
+delete window.__phantomas;
+"""
+
+STEALTH_JS_FIREFOX = """
+Object.defineProperty(navigator, 'webdriver', { get: () => false });
+Object.defineProperty(navigator, 'languages', { get: () => ['zh-CN','zh','en-US','en'] });
+Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
+Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });
 delete window.callPhantom;
 delete window._phantom;
 delete window.__phantomas;
@@ -130,7 +174,7 @@ class Scroller:
 
     async def run(self) -> None:
         self._running = True
-        print("▶️  自动滚动已启动，按 Ctrl+C 停止\n")
+        print("▶️  自动滚动已启动\n")
         await self._safe_center_mouse()
         while self._running:
             await self._maybe_pause()
@@ -231,26 +275,62 @@ class Scroller:
 # 浏览器启动
 # ═══════════════════════════════════════════════════════════════
 
-async def launch_browser():
-    """返回 (playwright, browser, context, page)"""
-    pw = await async_playwright().start()
-    browser = await pw.chromium.launch(
-        channel="msedge",
-        headless=False,
-        args=["--disable-blink-features=AutomationControlled"],
-    )
-    context = await browser.new_context(
-        viewport={"width": 1366, "height": 768},
-        locale="zh-CN",
-        timezone_id="Asia/Shanghai",
-        user_agent=(
+async def launch_browser(browser_type: str = "edge"):
+    """
+    启动指定浏览器并配置反检测上下文。
+    支持: edge, chrome, firefox
+    """
+    # ── 浏览器引擎 & 启动参数 ──
+    ua_map = {
+        "edge": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
             "Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0"
         ),
+        "chrome": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/131.0.0.0 Safari/537.36"
+        ),
+        "firefox": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:135.0) "
+            "Gecko/20100101 Firefox/135.0"
+        ),
+    }
+    stealth_map = {
+        "edge": STEALTH_JS_CHROMIUM,
+        "chrome": STEALTH_JS_CHROMIUM,
+        "firefox": STEALTH_JS_FIREFOX,
+    }
+    channel_map = {"edge": "msedge", "chrome": "chrome", "firefox": None}
+
+    user_agent = ua_map[browser_type]
+    stealth = stealth_map[browser_type]
+    channel = channel_map[browser_type]
+
+    # PyInstaller 兼容：强制浏览器路径到用户目录
+    import os
+    os.environ["PLAYWRIGHT_BROWSERS_PATH"] = _get_browsers_path()
+
+    pw = await async_playwright().start()
+
+    if browser_type == "firefox":
+        browser = await pw.firefox.launch(headless=False)
+    else:
+        browser = await pw.chromium.launch(
+            channel=channel,
+            headless=False,
+            args=["--disable-blink-features=AutomationControlled"],
+        )
+
+    context = await browser.new_context(
+        viewport={"width": 1366, "height": 768},
+        locale="zh-CN",
+        timezone_id="Asia/Shanghai",
+        user_agent=user_agent,
         bypass_csp=True,
     )
-    await context.add_init_script(STEALTH_JS)
+    await context.add_init_script(stealth)
     page = await context.new_page()
     return pw, browser, context, page
 
@@ -297,38 +377,100 @@ async def _try_recover_page(ctx, closed_page: Page) -> Optional[Page]:
     return None
 
 
-async def _pick_reading_page(ctx, current_page: Page) -> Optional[Page]:
+async def _pick_reading_page(ctx, current_page: Page,
+                              tab_index: Optional[int] = None) -> Optional[Page]:
     """
     智能选择阅读页面：
-    - 如果当前页面已是阅读页，直接返回
-    - 如果当前是个人空间/空白页，扫描所有打开的标签页找阅读页
-    - 找不到则提示用户
+    1. 如果指定了 --tab，按标签页位置选择（0-base）
+    2. 如果当前页面已是阅读页，直接返回
+    3. 扫描所有标签页，列出候选让用户交互选择
+    4. 找不到则提示
     """
     all_pages: list[Page] = ctx.pages
     current_url = (current_page.url or "").lower()
 
-    # 1. 当前页面就是阅读页
+    # ═══ 1. --tab 模式 ═══
+    if tab_index is not None:
+        if tab_index < 0 or tab_index >= len(all_pages):
+            print(f"❌ --tab {tab_index} 超出范围，共有 {len(all_pages)} 个标签页")
+            return None
+        chosen = all_pages[tab_index]
+        await chosen.bring_to_front()
+        await asyncio.sleep(0.5)
+        print(f"✅ 已切换到标签页 [{tab_index}]: {chosen.url[:80]}")
+        return chosen
+
+    # ═══ 2. 当前页面就是阅读页 ═══
     if any(marker in current_url for marker in READING_PAGE_MARKERS):
-        print(f"✅ 已定位阅读页: {current_page.url[:80]}")
+        print(f"✅ 当前页面已是阅读页: {current_page.url[:80]}")
         return current_page
 
-    # 2. 当前是个人空间 — 扫描其他标签页
-    if "i.chaoxing.com" in current_url or "about:blank" in current_url:
-        print(f"📍 当前在个人空间，扫描其他标签页...")
-        for p in all_pages:
-            if p == current_page:
-                continue
-            purl = (p.url or "").lower()
-            if any(marker in purl for marker in READING_PAGE_MARKERS):
-                await p.bring_to_front()
-                await asyncio.sleep(0.5)
-                print(f"✅ 已切换到阅读页: {p.url[:80]}")
-                return p
+    # ═══ 3. 扫描所有标签页 ═══
+    print("📍 扫描所有标签页...")
+    candidates = []
+    for p in all_pages:
+        purl = (p.url or "").lower()
+        if any(marker in purl for marker in READING_PAGE_MARKERS):
+            candidates.append(p)
 
-    # 3. 找不到 — 提示用户
-    print("⚠️  未找到阅读页面！")
-    print("   请在浏览器中打开阅读任务页面（URL 含 studentstudy/mycourse），然后重新运行。")
-    return None
+    print(f"   共 {len(all_pages)} 个标签页，{len(candidates)} 个匹配阅读任务")
+
+    if len(candidates) == 0:
+        print("⚠️  未找到阅读页面！")
+        print("   请在浏览器中打开阅读任务页面，然后重新运行。")
+        print("   也可用 --tab N 指定标签页位置（0-base，如 --tab 2）")
+        return None
+
+    # 打印所有标签页
+    print()
+    print("  ┌─ 标签页列表 ──────────────────────────")
+    for i, p in enumerate(all_pages):
+        purl = (p.url or "").lower()
+        tag = " ● 匹配" if any(m in purl for m in READING_PAGE_MARKERS) else ""
+        print(f"  │ [{i}] {p.url[:80]}{tag}")
+    print("  └─────────────────────────────────────────")
+    print()
+
+    if len(candidates) == 1:
+        chosen = candidates[0]
+        await chosen.bring_to_front()
+        await asyncio.sleep(0.5)
+        print(f"✅ 自动切换到唯一匹配标签页: {chosen.url[:80]}")
+        return chosen
+
+    # ═══ 4. 多个匹配 → 交互式选择 ═══
+    print(f"⚠️  发现 {len(candidates)} 个匹配标签页，请选择：")
+    for p in candidates:
+        idx = all_pages.index(p)
+        print(f"   [{idx}] {p.url[:80]}")
+
+    selected = await _interactive_pick(all_pages)
+    if selected is not None:
+        return selected
+    print("  ⏭️  跳过，使用当前页面继续")
+    return current_page if current_page.url != "about:blank" else candidates[0]
+
+
+async def _interactive_pick(all_pages: list) -> Optional[Page]:
+    """交互式选择标签页。返回选中的 Page，或 None 表示跳过"""
+    while True:
+        try:
+            choice = await asyncio.get_event_loop().run_in_executor(
+                None, input,
+                "  输入序号 (0~{}), 或按 Enter 跳过: ".format(len(all_pages) - 1)
+            )
+            if choice.strip() == "":
+                return None
+            idx = int(choice.strip())
+            if 0 <= idx < len(all_pages):
+                chosen = all_pages[idx]
+                await chosen.bring_to_front()
+                await asyncio.sleep(0.5)
+                print(f"✅ 已切换到标签页 [{idx}]: {chosen.url[:80]}")
+                return chosen
+            print(f"   ❌ 序号超出范围（0~{len(all_pages)-1}）")
+        except ValueError:
+            print("   ❌ 请输入数字")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -337,7 +479,9 @@ async def _pick_reading_page(ctx, current_page: Page) -> Optional[Page]:
 
 async def run(url: str, duration_min: Optional[float] = None,
               min_iv: float = SCROLL_MIN_INTERVAL,
-              max_iv: float = SCROLL_MAX_INTERVAL):
+              max_iv: float = SCROLL_MAX_INTERVAL,
+              tab_index: Optional[int] = None,
+              browser_type: str = DEFAULT_BROWSER):
     stats = Stats()
     pw = None
     browser: Optional[Browser] = None
@@ -350,8 +494,17 @@ async def run(url: str, duration_min: Optional[float] = None,
     signal.signal(signal.SIGINT, lambda *_: on_exit())
 
     try:
-        print("🚀 启动 Edge 浏览器...")
-        pw, browser, ctx, page = await launch_browser()
+        browser_label = {"edge": "Edge", "chrome": "Chrome", "firefox": "Firefox"}.get(browser_type, browser_type)
+        print(f"🚀 启动 {browser_label} 浏览器...")
+
+        # Firefox 驱动预检
+        if browser_type == "firefox" and not firefox_driver_exists():
+            print("❌ Firefox 驱动未安装")
+            print("   请运行:  uv run playwright install firefox")
+            print("   或者:    playwright install firefox")
+            return
+
+        pw, browser, ctx, page = await launch_browser(browser_type=browser_type)
 
         print(f"📖 打开 {url}")
         try:
@@ -380,7 +533,7 @@ async def run(url: str, duration_min: Optional[float] = None,
         await asyncio.sleep(2)
 
         # 智能选择页面：如果当前是个人空间，自动切到阅读页
-        page = await _pick_reading_page(ctx, page)
+        page = await _pick_reading_page(ctx, page, tab_index=tab_index)
         if page is None:
             print("❌ 未找到阅读页面，请确保已打开阅读任务页面后重试")
             return
@@ -434,8 +587,9 @@ def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="示例:\n"
                "  uv run python main.py\n"
-               "  uv run python main.py --duration 30\n"
-               "  uv run python main.py --duration 45 --url https://passport2.chaoxing.com",
+               "  uv run python main.py --browser chrome\n"
+               "  uv run python main.py --browser firefox --duration 30\n"
+               "  uv run python main.py --tab 2",
     )
     p.add_argument("--duration", "-d", type=float, default=None,
                    help="运行时长（分钟），不指定则手动 Ctrl+C 停止")
@@ -445,6 +599,11 @@ def main() -> None:
                    help=f"最小滚动间隔秒数（默认: {SCROLL_MIN_INTERVAL}）")
     p.add_argument("--max-interval", type=float, default=SCROLL_MAX_INTERVAL,
                    help=f"最大滚动间隔秒数（默认: {SCROLL_MAX_INTERVAL}）")
+    p.add_argument("--tab", "-t", type=int, default=None,
+                   help="标签页序号（0-base），不指定则自动匹配或交互选择")
+    p.add_argument("--browser", "-b", type=str, default=DEFAULT_BROWSER,
+                   choices=BROWSER_CHOICES,
+                   help=f"浏览器（默认: {DEFAULT_BROWSER}）")
     args = p.parse_args()
 
     if args.min_interval > args.max_interval:
@@ -463,6 +622,8 @@ def main() -> None:
         duration_min=args.duration,
         min_iv=args.min_interval,
         max_iv=args.max_interval,
+        tab_index=args.tab,
+        browser_type=args.browser,
     ))
 
 
