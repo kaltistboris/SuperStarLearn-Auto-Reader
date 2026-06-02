@@ -29,6 +29,7 @@ from main import (
     launch_browser, _pick_reading_page,
     READING_PAGE_MARKERS,
     firefox_driver_exists,
+    _ensure_firefox_bundled,
 )
 
 # ═══════════════════════════════════════════════════════════════
@@ -455,10 +456,11 @@ class App:
         # 收集浏览器选择
         browser_type = self.var_browser.get()
 
-        # Firefox 驱动检测
+        # Firefox 驱动检测（优先从 exe 内嵌解包）
         if browser_type == "firefox" and not firefox_driver_exists():
-            if not self._prompt_firefox_install():
-                return
+            if not _ensure_firefox_bundled():
+                if not self._prompt_firefox_install():
+                    return
 
         # 启动日志重定向
         self.redirector = LogRedirector(self.log_text)
@@ -607,7 +609,7 @@ class App:
         ttk.Label(dialog, text="也可以手动运行:  playwright install firefox",
                   wraplength=440, foreground="gray").pack(pady=(0, 10))
 
-        result = [False]  # 闭包传值
+        result = [False]
 
         def on_install():
             result[0] = True
@@ -627,31 +629,41 @@ class App:
         if not result[0]:
             return False
 
-        # 后台安装
-        self._set_state("stopping")
-        self.var_status.set("正在安装 Firefox 驱动...")
-        print("📥 开始下载 Firefox 驱动...")
-        self.root.update()
+        # 循环安装（失败可重试）
+        while True:
+            self._set_state("stopping")
+            self.var_status.set("正在安装 Firefox 驱动...")
+            print("📥 开始下载 Firefox 驱动...")
+            self.root.update()
 
-        success = self._run_firefox_install()
+            success = self._run_firefox_install()
 
-        if not success:
-            messagebox.showerror("安装失败",
-                "Firefox 驱动下载失败，请手动运行:\n\n  uv run playwright install firefox")
-            self._set_state("idle")
-            return False
+            if success:
+                print("✅ Firefox 驱动安装完成")
+                self._set_state("idle")
+                return True
 
-        print("✅ Firefox 驱动安装完成")
-        self.var_status.set("就绪")
-        self._set_state("idle")
-        return True
+            # 失败 → 弹窗重试
+            retry = messagebox.askretrycancel(
+                "安装失败",
+                "Firefox 驱动下载失败，请检查网络连接。\n\n"
+                "也可以手动运行命令:\n"
+                "  uv run playwright install firefox"
+            )
+            if not retry:
+                self._set_state("idle")
+                return False
+            # 点击重试 → 继续循环
 
     def _run_firefox_install(self) -> bool:
-        """运行 playwright install firefox，返回是否成功"""
-        import subprocess, sys, os
-        from main import _get_browsers_path
+        """运行 playwright install firefox，带超时和残留清理"""
+        import subprocess, sys, os, time
+        from pathlib import Path
+        from main import _get_browsers_path, firefox_driver_exists
+
         env = os.environ.copy()
         env["PLAYWRIGHT_BROWSERS_PATH"] = _get_browsers_path()
+
         try:
             proc = subprocess.Popen(
                 [sys.executable, "-m", "playwright", "install", "firefox"],
@@ -659,15 +671,54 @@ class App:
                 text=True, creationflags=subprocess.CREATE_NO_WINDOW,
                 env=env,
             )
-            for line in proc.stdout:
-                if line.strip():
-                    print(f"  {line.strip()}")
-                    self.root.update()
+            start = time.time()
+            timeout = 300  # 5 分钟超时
+            for line in iter(proc.stdout.readline, ""):
+                if line:
+                    stripped = line.strip()
+                    if stripped:
+                        print(f"  {stripped}")
+                        self.root.update()
+                if time.time() - start > timeout:
+                    proc.kill()
+                    print("  ❌ 安装超时（>5分钟），请检查网络")
+                    self._cleanup_firefox_dir()
+                    return False
             proc.wait()
-            return proc.returncode == 0
+
+            if proc.returncode != 0:
+                self._cleanup_firefox_dir()
+                return False
+
+            # 再次校验 firefox.exe 是否真实存在
+            if not firefox_driver_exists():
+                self._cleanup_firefox_dir()
+                return False
+
+            return True
+
         except Exception as e:
             print(f"  ❌ 安装异常: {e}")
+            self._cleanup_firefox_dir()
             return False
+
+    def _cleanup_firefox_dir(self) -> None:
+        """清理残留的 Firefox 空/不完整目录，防止下次误判"""
+        from pathlib import Path
+        import shutil
+        from main import _get_browsers_path
+        base = Path(_get_browsers_path())
+        if not base.exists():
+            return
+        for p in base.iterdir():
+            if p.is_dir() and p.name.startswith("firefox-"):
+                exe = p / "firefox" / "firefox.exe"
+                if not exe.exists():
+                    try:
+                        shutil.rmtree(p, ignore_errors=True)
+                        print(f"  🧹 已清理不完整驱动目录: {p.name}")
+                    except Exception:
+                        pass
 
     # ── 启动 ──
 

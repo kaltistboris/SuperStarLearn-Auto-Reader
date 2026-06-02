@@ -71,12 +71,42 @@ def _get_browsers_path() -> str:
 
 
 def firefox_driver_exists() -> bool:
-    """检查 Playwright Firefox 驱动是否已下载（兼容 exe 环境）"""
+    """检查 Playwright Firefox 驱动是否已下载（校验 firefox.exe 本体）"""
     from pathlib import Path
     base = Path(_get_browsers_path())
     if not base.exists():
         return False
-    return any(p.name.startswith("firefox-") for p in base.iterdir() if p.is_dir())
+    for p in base.iterdir():
+        if p.is_dir() and p.name.startswith("firefox-"):
+            exe = p / "firefox" / "firefox.exe"
+            if exe.exists():
+                return True
+    return False
+
+
+def _ensure_firefox_bundled() -> bool:
+    """从 exe 内嵌资源中复制 Firefox 驱动到 AppData（仅在 PyInstaller 打包后生效）"""
+    import sys, shutil
+    from pathlib import Path
+    if firefox_driver_exists():
+        return True
+    if not getattr(sys, "frozen", False):
+        return False
+    bundled = Path(sys._MEIPASS) / ".playwright_browsers" / "firefox-1511"
+    if not bundled.exists():
+        return False
+    target = Path(_get_browsers_path()) / "firefox-1511"
+    if target.exists():
+        shutil.rmtree(target, ignore_errors=True)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    print("📦 正在解压内置 Firefox 驱动...")
+    shutil.copytree(bundled, target)
+    ok = firefox_driver_exists()
+    if ok:
+        print("✅ Firefox 驱动解压完成")
+    else:
+        print("❌ Firefox 驱动解压失败")
+    return ok
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -497,12 +527,11 @@ async def run(url: str, duration_min: Optional[float] = None,
         browser_label = {"edge": "Edge", "chrome": "Chrome", "firefox": "Firefox"}.get(browser_type, browser_type)
         print(f"🚀 启动 {browser_label} 浏览器...")
 
-        # Firefox 驱动预检
+        # Firefox 驱动预检（优先从 exe 内嵌解包）
         if browser_type == "firefox" and not firefox_driver_exists():
-            print("❌ Firefox 驱动未安装")
-            print("   请运行:  uv run playwright install firefox")
-            print("   或者:    playwright install firefox")
-            return
+            if not _ensure_firefox_bundled():
+                print("❌ Firefox 驱动未安装")
+                return
 
         pw, browser, ctx, page = await launch_browser(browser_type=browser_type)
 
