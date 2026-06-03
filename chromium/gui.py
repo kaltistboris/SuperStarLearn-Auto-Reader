@@ -91,7 +91,7 @@ class GuiWorker:
         self._tabs_ready = threading.Event()
         self._tab_chosen = threading.Event()
         self._tab_info: list[tuple[int, str]] = []
-        self._selected_tab_idx: Optional[int] = None
+        self._selected_tab_idx: int = 0
 
     # ── 外部控制接口 ──
 
@@ -153,7 +153,7 @@ class GuiWorker:
 
         try:
             # 1. 启动浏览器
-            label = {"edge": "Edge", "chrome": "Chrome", "firefox": "Firefox"}.get(self.browser_type, self.browser_type)
+            label = {"edge": "Edge", "chrome": "Chrome"}.get(self.browser_type, self.browser_type)
             print(f"🚀 启动 {label} 浏览器...")
             pw, browser, ctx, page = await launch_browser(browser_type=self.browser_type)
 
@@ -552,7 +552,7 @@ class App:
 
         def on_ok():
             sel = listbox.curselection()
-            if sel:
+            if sel and self.worker:
                 self.worker.select_tab(sel[0])
                 dialog.destroy()
                 self._showing_tab_picker = False
