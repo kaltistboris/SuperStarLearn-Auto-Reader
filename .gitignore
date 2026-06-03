@@ -12,4 +12,6 @@ wheels/
 # PyInstaller
 *.spec
 *.manifest
-SuperStarAutoReader.spec
+
+# Build artifacts
+SuperStarAutoReader*.zip

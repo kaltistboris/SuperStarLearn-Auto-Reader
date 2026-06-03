@@ -7,11 +7,10 @@
 用法:
     uv run python main.py                              # 默认 Edge
     uv run python main.py --browser chrome              # 使用 Chrome
-    uv run python main.py --browser firefox             # 使用 Firefox
     uv run python main.py --duration 30                 # 30 分钟后自动停止
     uv run python main.py --tab 2                       # 选择第 3 个标签页
 
-依赖: playwright (channel=msedge/chrome/firefox)
+依赖: playwright (channel=msedge/chrome, 使用系统 Edge/Chrome 浏览器)
 """
 
 import asyncio
@@ -31,9 +30,7 @@ from playwright.async_api import async_playwright, Browser, Page
 
 DEFAULT_URL = "https://mooc1.chaoxing.com"
 DEFAULT_BROWSER = "edge"
-
-# 浏览器选择
-BROWSER_CHOICES = ["edge", "chrome", "firefox"]
+BROWSER_CHOICES = ["edge", "chrome"]
 
 # 滚动
 SCROLL_MIN_INTERVAL = 2.0       # 滚动间隔下限（秒）
@@ -52,68 +49,10 @@ PAUSE_DURATION_MIN = 15         # 暂停 15~45 秒
 PAUSE_DURATION_MAX = 45
 
 # ═══════════════════════════════════════════════════════════════
-# 工具函数
-# ═══════════════════════════════════════════════════════════════
-
-def _get_browsers_path() -> str:
-    """
-    获取 Playwright 浏览器存储路径（支持 exe 环境）。
-    PyInstaller 打包后 playwright 会错误地在临时目录找浏览器，
-    通过设置环境变量 PLAYWRIGHT_BROWSERS_PATH 纠正。
-    """
-    import os
-    from pathlib import Path
-    # 优先读取已有环境变量（用户自定义），否则用默认路径
-    env = os.environ.get("PLAYWRIGHT_BROWSERS_PATH")
-    if env:
-        return env
-    return str(Path.home() / "AppData" / "Local" / "ms-playwright")
-
-
-def firefox_driver_exists() -> bool:
-    """检查 Playwright Firefox 驱动是否已下载（校验 firefox.exe 本体）"""
-    from pathlib import Path
-    base = Path(_get_browsers_path())
-    if not base.exists():
-        return False
-    for p in base.iterdir():
-        if p.is_dir() and p.name.startswith("firefox-"):
-            exe = p / "firefox" / "firefox.exe"
-            if exe.exists():
-                return True
-    return False
-
-
-def _ensure_firefox_bundled() -> bool:
-    """从 exe 内嵌资源中复制 Firefox 驱动到 AppData（仅在 PyInstaller 打包后生效）"""
-    import sys, shutil
-    from pathlib import Path
-    if firefox_driver_exists():
-        return True
-    if not getattr(sys, "frozen", False):
-        return False
-    bundled = Path(sys._MEIPASS) / ".playwright_browsers" / "firefox-1511"
-    if not bundled.exists():
-        return False
-    target = Path(_get_browsers_path()) / "firefox-1511"
-    if target.exists():
-        shutil.rmtree(target, ignore_errors=True)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    print("📦 正在解压内置 Firefox 驱动...")
-    shutil.copytree(bundled, target)
-    ok = firefox_driver_exists()
-    if ok:
-        print("✅ Firefox 驱动解压完成")
-    else:
-        print("❌ Firefox 驱动解压失败")
-    return ok
-
-
-# ═══════════════════════════════════════════════════════════════
 # 反检测脚本
 # ═══════════════════════════════════════════════════════════════
 
-STEALTH_JS_CHROMIUM = """
+STEALTH_JS = """
 Object.defineProperty(navigator, 'webdriver', { get: () => false });
 window.chrome = { runtime: {}, loadTimes: function() {}, csi: function() {}, app: {} };
 Object.defineProperty(navigator, 'plugins', {
@@ -131,16 +70,6 @@ Object.defineProperty(navigator, 'languages', { get: () => ['zh-CN','zh','en-US'
 Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
 Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });
 Object.defineProperty(navigator, 'vendor', { get: () => 'Google Inc.' });
-delete window.callPhantom;
-delete window._phantom;
-delete window.__phantomas;
-"""
-
-STEALTH_JS_FIREFOX = """
-Object.defineProperty(navigator, 'webdriver', { get: () => false });
-Object.defineProperty(navigator, 'languages', { get: () => ['zh-CN','zh','en-US','en'] });
-Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
-Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });
 delete window.callPhantom;
 delete window._phantom;
 delete window.__phantomas;
@@ -308,9 +237,8 @@ class Scroller:
 async def launch_browser(browser_type: str = "edge"):
     """
     启动指定浏览器并配置反检测上下文。
-    支持: edge, chrome, firefox
+    支持: edge, chrome
     """
-    # ── 浏览器引擎 & 启动参数 ──
     ua_map = {
         "edge": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -322,36 +250,19 @@ async def launch_browser(browser_type: str = "edge"):
             "AppleWebKit/537.36 (KHTML, like Gecko) "
             "Chrome/131.0.0.0 Safari/537.36"
         ),
-        "firefox": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:135.0) "
-            "Gecko/20100101 Firefox/135.0"
-        ),
     }
-    stealth_map = {
-        "edge": STEALTH_JS_CHROMIUM,
-        "chrome": STEALTH_JS_CHROMIUM,
-        "firefox": STEALTH_JS_FIREFOX,
-    }
-    channel_map = {"edge": "msedge", "chrome": "chrome", "firefox": None}
+    channel_map = {"edge": "msedge", "chrome": "chrome"}
 
     user_agent = ua_map[browser_type]
-    stealth = stealth_map[browser_type]
     channel = channel_map[browser_type]
-
-    # PyInstaller 兼容：强制浏览器路径到用户目录
-    import os
-    os.environ["PLAYWRIGHT_BROWSERS_PATH"] = _get_browsers_path()
 
     pw = await async_playwright().start()
 
-    if browser_type == "firefox":
-        browser = await pw.firefox.launch(headless=False)
-    else:
-        browser = await pw.chromium.launch(
-            channel=channel,
-            headless=False,
-            args=["--disable-blink-features=AutomationControlled"],
-        )
+    browser = await pw.chromium.launch(
+        channel=channel,
+        headless=False,
+        args=["--disable-blink-features=AutomationControlled"],
+    )
 
     context = await browser.new_context(
         viewport={"width": 1366, "height": 768},
@@ -360,7 +271,7 @@ async def launch_browser(browser_type: str = "edge"):
         user_agent=user_agent,
         bypass_csp=True,
     )
-    await context.add_init_script(stealth)
+    await context.add_init_script(STEALTH_JS)
     page = await context.new_page()
     return pw, browser, context, page
 
@@ -524,14 +435,8 @@ async def run(url: str, duration_min: Optional[float] = None,
     signal.signal(signal.SIGINT, lambda *_: on_exit())
 
     try:
-        browser_label = {"edge": "Edge", "chrome": "Chrome", "firefox": "Firefox"}.get(browser_type, browser_type)
+        browser_label = {"edge": "Edge", "chrome": "Chrome"}.get(browser_type, browser_type)
         print(f"🚀 启动 {browser_label} 浏览器...")
-
-        # Firefox 驱动预检（优先从 exe 内嵌解包）
-        if browser_type == "firefox" and not firefox_driver_exists():
-            if not _ensure_firefox_bundled():
-                print("❌ Firefox 驱动未安装")
-                return
 
         pw, browser, ctx, page = await launch_browser(browser_type=browser_type)
 
@@ -617,7 +522,7 @@ def main() -> None:
         epilog="示例:\n"
                "  uv run python main.py\n"
                "  uv run python main.py --browser chrome\n"
-               "  uv run python main.py --browser firefox --duration 30\n"
+               "  uv run python main.py --duration 30\n"
                "  uv run python main.py --tab 2",
     )
     p.add_argument("--duration", "-d", type=float, default=None,
